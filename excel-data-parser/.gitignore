@@ -1,0 +1,25 @@
+# Python 실행·개발 도구가 생성하는 파일
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+
+# 로컬 환경 설정과 비밀값
+.DS_Store
+.env
+.env.*
+!.env.example
+
+# 원본 데이터와 결과·로그는 Git으로 추적하지 않는다.
+/Data/
+/output/
+/logs/
+*.xlsx
+*.xlsm
+*.xlsb
+*.xls
+~$*
