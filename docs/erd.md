@@ -1,23 +1,29 @@
-# ERD 초안
+![ERD](erd.svg)
 
+<!--
 ```mermaid
 erDiagram
-    organization ||--o{ app_user : "소속"
+    organization |o--o{ app_user : "소속"
     organization ||--o{ submission : "제출"
     annual_plan ||--o{ submission_request : "연도"
     app_user ||--o{ submission_request : "요청"
     submission_request ||--o{ submission : "요청에 대한 제출"
-    submission ||--o{ financial_value : "파싱 결과"
-    account_item ||--o{ financial_value : "항목"
-    account_item ||--o| account_item : "상위 항목"
+    submission ||--o| parsing_job : "파싱 작업"
+    submission ||--o{ financial_line : "원본 상세행"
+    account_item ||--o{ financial_line : "항목"
+    financial_line ||--o{ financial_value : "월별 금액"
+    account_item |o--o{ account_item : "상위 항목"
     submission ||--o{ change_reason : "변경 사유"
+    submission ||--o{ change_reason : "이전 승인본"
     account_item ||--o{ change_reason : "항목"
     submission ||--o{ gap_item : "Gap"
+    submission ||--o{ gap_item : "확정 계획 기준본"
     account_item ||--o{ gap_item : "항목"
     gap_threshold ||--o{ gap_item : "적용 기준"
     gap_item ||--o{ gap_explanation : "소명 회차"
     master_version ||--|{ master_source : "구성"
     submission ||--o{ master_source : "포함"
+    organization ||--o{ master_source : "조직별 승인본"
     app_user ||--o{ notification_event : "수신"
 
     organization {
@@ -62,7 +68,7 @@ erDiagram
         bigint request_id FK
         bigint organization_id FK
         int seq "회차 NN"
-        varchar version_label UK "YYYY-MM-NN (조직별)"
+        varchar version_label "조직별 유일, 연간계획 표기는 미정"
         varchar status "PENDING | REJECTED | APPROVED"
         varchar s3_key "원본 엑셀"
         char sha256
@@ -73,32 +79,66 @@ erDiagram
         text reject_reason
     }
 
+    parsing_job {
+        bigint id PK
+        bigint submission_id FK,UK
+        varchar status "QUEUED | RUNNING | NEEDS_REVIEW | SUCCEEDED | FAILED"
+        varchar parser_version "사용한 파서 버전"
+        int attempt_count "실행 시도 횟수"
+        varchar result_s3_key "원본 추출·표준 레코드·진단 결과 참조"
+        varchar error_code
+        text error_message
+        timestamp created_at
+        timestamp started_at
+        timestamp finished_at
+    }
+
     account_item {
         bigint id PK
-        varchar code UK "원본 항목·예산코드"
+        varchar code UK "내부 항목 식별키"
+        varchar source_type "REVENUE_CLASS | EXPENSE_BUDGET"
+        varchar source_code "원본 항목·예산코드, 없으면 null"
         varchar name
         bigint parent_id FK
     }
 
-    financial_value {
+    financial_line {
         bigint id PK
         bigint submission_id FK
         bigint item_id FK
-        int year
-        int month
+        varchar headquarters_code "본부코드, 원본에 없으면 null"
+        varchar team_code "팀코드, 사업부코드와 구분"
+        varchar task_code "실행과제코드, 없으면 null"
+        varchar cost_type "비용구분"
+        varchar actual_basis "실적집계기준"
+        text description "거래내역 및 산출근거"
+        varchar source_sheet
+        int source_row "제출본 내 원본 행 번호"
+    }
+
+    financial_value {
+        bigint id PK
+        bigint line_id FK
+        int year "금액의 대상 연도"
+        int month "1부터 12, 연간합계 제외"
         varchar scenario "PLAN | ACTUAL | ESTIMATE"
         varchar measure "REVENUE | COST"
         numeric amount "원 단위, Decimal"
+        text raw_value "원본 숫자 또는 수식 저장값"
+        varchar raw_unit "원본 금액 단위"
+        numeric normalization_multiplier "원 환산 배율"
         varchar source_cell "시트!셀"
     }
 
     change_reason {
         bigint id PK
         bigint submission_id FK
+        bigint previous_submission_id FK "대상 월의 마지막 승인본"
         bigint item_id FK
         int year
         int month
-        varchar measure
+        varchar scenario "PLAN | ACTUAL | ESTIMATE"
+        varchar measure "REVENUE | COST"
         numeric previous_value "마지막 승인본 값"
         numeric new_value
         text reason
@@ -115,8 +155,9 @@ erDiagram
     gap_item {
         bigint id PK
         bigint submission_id FK
+        bigint plan_submission_id FK "비교에 사용한 확정 계획 승인본"
         bigint organization_id FK
-        bigint item_id FK
+        bigint item_id FK "공통 손익 항목 연결 방식은 미정"
         int year
         int month
         numeric plan_profit "계획 손익"
@@ -165,3 +206,4 @@ erDiagram
         timestamp read_at
     }
 ```
+-->
