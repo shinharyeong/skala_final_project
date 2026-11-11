@@ -9,7 +9,6 @@
 | 파랑 | 경영기획 담당자 |
 | 노랑 | 조직 담당자 |
 | 회색 | 시스템 (자동 처리) |
-| 점선 | 미정 사항 |
 
 ## 전체 단계
 
@@ -155,7 +154,7 @@ flowchart TD
 flowchart TD
     A(["조직 제출본 승인"])
     B{"해당 월 모든 조직<br/>승인 완료?"}
-    B1["대기<br/>(최초 생성 시점·미제출 조직 처리 미정)"]
+    B1["대기<br/>홈에 master 미생성 (승인 N/M 조직)<br/>미승인 조직 목록 표시"]
     C["master 생성<br/>master-YYYY-MM-01<br/>조직 승인본 합산"]
     D["홈: 전사 손익 현황 갱신<br/>합산 영업이익 / Contingency / 보고 영업이익"]
     E["연·월 필터로 이전 master 조회<br/>소명 요청·회신 현황"]
@@ -175,11 +174,9 @@ flowchart TD
     classDef planner fill:#E3EDFD,stroke:#3B6FD8,color:#1A2B4C
     classDef system fill:#EFEFEF,stroke:#8A8A8A,color:#222
     classDef terminal fill:#D7F4DD,stroke:#3E9E55,color:#173D20
-    classDef undecided fill:#FFFFFF,stroke:#8A8A8A,stroke-dasharray:5 4,color:#555
     class E,F,G planner
-    class B,C,D,X,Y system
+    class B,B1,C,D,X,Y system
     class A,H terminal
-    class B1 undecided
 ```
 
 ## 상태
