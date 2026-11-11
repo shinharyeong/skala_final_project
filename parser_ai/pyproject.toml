@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "skala-excel-parser-ai"
+version = "0.1.0"
+description = "Evidence-grounded OpenAI semantic Excel parser with the existing output contract"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+parser-ai = "excel_parser_ai.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
