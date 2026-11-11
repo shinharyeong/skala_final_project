@@ -30,7 +30,7 @@
 Python 3.11 이상과 표준 라이브러리만 사용합니다. 저장소 루트에서 모듈 폴더로 이동합니다.
 
 ```bash
-cd excel-data-parser
+cd parser
 PYTHONPATH=src python3 -B -m excel_parser paths
 
 # 별도 관리하는 단일 원본을 읽고 검증한다.

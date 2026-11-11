@@ -2,7 +2,7 @@
 
 ## 엑셀 데이터 파싱
 
-경영기획용 엑셀에서 원본 값과 구조를 보존하고, 조직·항목·기간·단위가 연결된 표준 레코드를 만드는 Python 모듈입니다. 코드는 [`excel-data-parser/`](excel-data-parser/)에서 관리합니다. 입력 데이터와 실행 결과는 저장소에 포함하지 않습니다.
+경영기획용 엑셀에서 원본 값과 구조를 보존하고, 조직·항목·기간·단위가 연결된 표준 레코드를 만드는 Python 모듈입니다. 코드는 [`parser/`](parser/)에서 관리합니다. 입력 데이터와 실행 결과는 저장소에 포함하지 않습니다.
 
 ### 파서 구성
 
@@ -23,4 +23,4 @@
 
 원본 보존과 업무 의미의 정확성은 구분합니다. 수식은 저장 캐시를 읽으며 Excel을 재계산하지 않습니다. `mapped`·`confirmed`는 규칙 적용 상태이고 독립적인 정답률이 아닙니다. DB·웹 API·업로드·승인·공식 마스터 발행 기능은 포함하지 않습니다.
 
-실행 방법과 테스트 구분은 [파서 README](excel-data-parser/README.md), 결과 필드와 타입은 [출력 계약](excel-data-parser/docs/development/output-contract.md)을 참고하세요.
+실행 방법과 테스트 구분은 [파서 README](parser/README.md), 결과 필드와 타입은 [출력 계약](parser/docs/development/output-contract.md)을 참고하세요.
