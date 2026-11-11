@@ -97,25 +97,3 @@ header_end_row (4): ..."`), `PROMPT`에 `start_row = header_end_row + 1`을
 `매출_세부_IFRS15後`가 더 이상 `failures`에 나타나지 않음(성공). 자세한
 원인 분석은 IMPLEMENTATION_STATUS.md의 "rectangle 검증 실패 원인 분석"
 섹션.
-
-## e. `.env.example` 키 노출
-
-**날짜**: 2026-11-11, 작업 초반(구조 해석 엔진 도입 이전).
-
-**증상**: `parser_ai/.env.example`에 placeholder가 아닌 실제 사용 가능한
-형태의 OpenAI API 키 값이 들어가 있었다. 1차 발견 후 제거했으나 파일이
-다시 복원되면서 동일한 키가 재발견되어 2차로 제거했다.
-
-**원인**: `.env.example`은 설계상 커밋·공유를 전제로 하는 템플릿 파일인데,
-실제 키 값이 그 안에 그대로 남아 있었다. 이 사건이 있었던 시점에는 이
-작업 폴더에 `.git` 저장소 자체가 없었고(ZIP 스냅샷), 이 시점까지 커밋·
-푸시·원격 공유가 전혀 없었다 — 따라서 이 키가 GitHub 등 외부로 실제
-유출(공개 노출)되었다는 증거는 없다.
-
-**조치**: 두 차례 모두 발견 즉시 값을 제거하고 빈 템플릿
-(`OPENAI_API_KEY=`)으로 되돌림. 이후 어떤 코드·문서·대화 로그에도 실제 키
-값을 기록하지 않음(길이·접두사 종류 등 메타데이터만 필요 시 언급). 이후
-모든 커밋·푸시 전에 `sk-`/`Bearer`/`svcacct` 패턴 grep 스캔을 수행했고,
-GitHub `ai_parser` 브랜치의 `.env.example`은 빈 값만 포함함(별도 확인됨).
-더 요약된 기록은 [IMPLEMENTATION_STATUS.md](../../IMPLEMENTATION_STATUS.md)의
-"보안 사고 기록" 섹션에도 있다.
