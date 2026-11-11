@@ -9,3 +9,4 @@
 - [도메인 규칙](domain-rules.md) — 제출·버전·변경 사유·Gap·master 규칙
 - [업무 흐름도](flow.md) — 연간 계획·월 실적·Gap 검토·master 단계별 흐름 (Mermaid)
 - [아키텍처](architecture.png) — AWS EKS · S3 · RDS 기반 인프라 구성도
+- [ERD 초안](erd.md) — 제출·Gap·소명·master 테이블 구조 (Mermaid)
