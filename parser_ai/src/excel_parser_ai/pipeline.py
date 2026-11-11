@@ -192,7 +192,9 @@ def run(inputs, output, *, client=None, prepare=False, metadata=None, recursive=
             summary["files"].append({"file": workbook["file"], "llm_inference_completed": inferred,
                                      "mapping_summary": mapped["summary"], "raw_validation_passed": raw_check["passed"],
                                      "provenance_validation_passed": provenance["passed"], "row_batches": row_batches,
-                                     "structure_sheets": len(semantic.get("structure_plans", [])) if semantic and structure_mode else None})
+                                     "structure_sheets": len(semantic.get("structure_plans", [])) if semantic and structure_mode else None,
+                                     "structure_interpretation_skipped_sheets": semantic.get("skipped_sheets", []) if semantic and structure_mode else [],
+                                     "structure_timeout_fallbacks": semantic.get("timeout_fallbacks", []) if semantic and structure_mode else []})
             checks["source_integrity"].append({"path": str(path), "sha256_before": before, "sha256_after": file_fingerprint(path)})
     summary["originals_unchanged"] = all(c["sha256_before"] == c["sha256_after"] for c in checks["source_integrity"])
     summary["raw_extraction_complete"] = summary["processed_file_count"] == len(files) and all(c["passed"] for c in checks["raw_extraction"]) and summary["originals_unchanged"]

@@ -11,9 +11,22 @@ from collections import Counter, defaultdict
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
+from .client import ModelError
 from .schema import STR, NULL_STR, NULL_INT, REF, UNIT, arr, obj
 from .shared import cell_index, column_number, normalize_number, ref
 
+# Sheets whose formula/content-cell ratio is at or above this are treated as
+# "auto-calculated" (e.g. an answer tab that only sums other sheets) and are
+# excluded from LLM structure interpretation entirely — measured case:
+# 답안지_IFRS15後 had a 0.955 ratio and alone caused a 46.6KB request that hit
+# a 240s timeout twice. Their formula cells get a bounded, source-grounded
+# recompute cross-check instead (see _recompute_sum_crosscheck); they never
+# get an LLM-assigned value.
+FORMULA_SKIP_RATIO = 0.3
+# A sheet with more candidate data rows than this is split into row-range
+# blocks BEFORE any call is made, rather than sent as one single request.
+LARGE_SHEET_ROW_THRESHOLD = 150
+ROW_BLOCK_SIZE = 100
 
 ROLE = {"type": "string", "enum": ["detail", "subtotal", "total", "ratio", "reference", "unknown"]}
 SCENARIO = {"type": "string", "enum": ["actual", "plan", "estimate", "mixed", "unknown"]}
@@ -67,6 +80,18 @@ and unresolved exceptions. Use real source pointers for year, scenario, unit
 and organization. All table numeric/formula rows must be covered by exactly
 one row rule and every financial value column by exactly one period range.
 Use compact ranges for consecutive columns/rows, splitting at changes.
+start_row MUST equal header_end_row + 1 — it is the first DATA row, never
+the same row as header_start_row or header_end_row. This holds even when a
+header label is merged across multiple rows (e.g. a two-row-tall merged
+cell spanning header_start_row..header_end_row in one column, while other
+columns carry separate label rows within that same range): the merged
+cell's anchor row is still a header row, not data. Do not use a row's
+numeric footprint to decide where data starts — a row positioned between a
+title and the real column-label header can itself contain numbers (an
+example/instructional/reference row) and still not be a data row. The true
+first data row is identified by each row carrying its own distinct
+item/organization label beneath the finished header, not by where numbers
+first appear.
 ancestor_rows lists source rows carrying parent account labels, in order;
 Python will read their labels from this same file to build the hierarchy.
 The year/scenario/month header refs are read again from EACH workbook; never
@@ -89,6 +114,17 @@ change signals, plus representative real stored values. It omits most raw
 amounts because those are preserved and processed locally. No rule-based
 semantic mapping or external answer master is provided. Never output code,
 formulas to evaluate, arbitrary expressions or instructions.
+"""
+
+BLOCK_NOTE = """
+
+This request covers ONLY rows {lo}-{hi} of this sheet. The sheet was split into
+row-range blocks to keep each request a manageable size; other blocks declare
+structure for every other row independently. Declare tables/rows ONLY within
+rows {lo}-{hi} — do not declare anything starting or ending outside that range.
+Rows {header_lo}-{header_hi} are included for header/unit/organization/scenario
+context only; you may still point evidence at real source cells in that range
+(e.g. a year or unit label above the block), but do not declare a table there.
 """
 
 
@@ -141,12 +177,24 @@ def _sign_class(cell):
         return "non_decimal"
 
 
-def structure_context(workbook, sheet):
-    """Every row is scanned; numeric payload is represented by footprint and samples."""
+def structure_context(workbook, sheet, *, row_range=None, header_row_range=None):
+    """Every in-scope row is scanned; numeric payload is represented by
+    footprint and samples.
+
+    row_range, when given, restricts the scanned/profiled rows to that
+    (start, end) inclusive range PLUS header_row_range (always included, for
+    cross-block header/unit continuity) — used to split a large sheet's
+    structure request into smaller row-range blocks. row_range=None (the
+    default) scans the whole sheet, unchanged from before blocks existed.
+    """
     by_row = defaultdict(list)
     for cell in sheet["cells"]:
         if cell.get("has_content", True):
             by_row[cell["row"]].append(cell)
+    if row_range is not None:
+        lo, hi = row_range
+        hlo, hhi = header_row_range or (0, -1)
+        by_row = {r: cells for r, cells in by_row.items() if (lo <= r <= hi) or (hlo <= r <= hhi)}
     formats = {}
     profiles = []
     examples = {}
@@ -183,6 +231,7 @@ def structure_context(workbook, sheet):
             "merges": sheet.get("merges", []), "number_formats": formats,
             "row_profiles": profiles, "total_row_profiles": total_profiles,
             "omitted_row_profiles": total_profiles - len(profiles),
+            "declared_row_range": [row_range[0], row_range[1]] if row_range else None,
             "representative_values": list(examples.values()),
             "cross_sheet_labels": [{"sheet": other["name"], "labels": _cross_labels(other)}
                 for other in workbook["sheets"] if other["name"] != sheet["name"]]}
@@ -200,8 +249,15 @@ def _pointers(value):
             yield from _pointers(child)
 
 
-def validate_plan(plan, workbook, sheet):
-    """Reject nonexistent evidence and overlapping/gapped declared coverage."""
+def validate_plan(plan, workbook, sheet, *, row_range=None):
+    """Reject nonexistent evidence and overlapping/gapped declared coverage.
+
+    row_range, when given, restricts the candidate-coverage check to that
+    row range and additionally rejects any table declared outside it — used
+    to validate one block of a sheet that was split into row-range blocks.
+    row_range=None (the default) validates the whole sheet, unchanged from
+    before blocks existed.
+    """
     from .engine import schema_errors
     errors = schema_errors({"plan": plan}, PLAN_RESPONSE)
     if errors:
@@ -212,12 +268,28 @@ def validate_plan(plan, workbook, sheet):
     for p in _pointers(plan):
         if (p["sheet"], p["cell"]) not in index:
             errors.append(f"missing evidence {p['sheet']}!{p['cell']}")
-    candidates = [c for c in sheet["cells"] if _candidate(c, plan)]
+    candidates = [c for c in sheet["cells"] if _candidate(c, plan) and (row_range is None or row_range[0] <= c["row"] <= row_range[1])]
     for table in plan["tables"]:
         try:
-            if (table["start_row"] > table["end_row"] or table["header_start_row"] > table["header_end_row"]
-                    or table["header_end_row"] >= table["start_row"] or column_number(table["start_col"]) > column_number(table["end_col"])):
-                errors.append("invalid table/header rectangle")
+            if row_range is not None and (table["start_row"] < row_range[0] or table["end_row"] > row_range[1]):
+                errors.append("table declared outside the requested block row range")
+            if table["start_row"] > table["end_row"]:
+                errors.append(f"table start_row ({table['start_row']}) must be <= end_row ({table['end_row']})")
+            if table["header_start_row"] > table["header_end_row"]:
+                errors.append(f"header_start_row ({table['header_start_row']}) must be <= header_end_row ({table['header_end_row']})")
+            if table["header_end_row"] >= table["start_row"]:
+                errors.append(
+                    f"table start_row ({table['start_row']}) must be greater than header_end_row "
+                    f"({table['header_end_row']}): start_row is the first DATA row, exactly "
+                    f"header_end_row + 1 — it is never equal to header_start_row or header_end_row, "
+                    f"even when a header label is merged across multiple rows (a merged header cell's "
+                    f"anchor row is still part of the header, not data). If a row just above the header "
+                    f"happens to contain numbers (e.g. an instructional/example row), that does not make "
+                    f"it a data row — data rows are identified by having their own distinct item/"
+                    f"organization label, not by numeric content alone."
+                )
+            if column_number(table["start_col"]) > column_number(table["end_col"]):
+                errors.append(f"table start_col ({table['start_col']}) must be <= end_col ({table['end_col']})")
             for group in table["periods"]:
                 if column_number(group["start_col"]) > column_number(group["end_col"]):
                     errors.append("reversed period range")
@@ -275,6 +347,123 @@ def validate_plan(plan, workbook, sheet):
         if len([u for u in table["unit_overrides"] if _inside(cell, u)]) > 1:
             errors.append(f"unit override overlap at {cell['address']}")
     return errors[:80]
+
+
+def _formula_ratio(sheet):
+    """formula_count / content_cell_count for one sheet, computed directly
+    from its cells (not a precomputed extraction-layer counter) so this
+    works identically on real extraction output and on test fixtures."""
+    cells = [c for c in sheet["cells"] if c.get("has_content", True)]
+    if not cells:
+        return 0.0
+    formulas = sum(1 for c in cells if c.get("formula"))
+    return formulas / len(cells)
+
+
+def _row_blocks(rows, size=ROW_BLOCK_SIZE):
+    """Split the (sorted) data-row numbers of a sheet into consecutive
+    row-NUMBER range blocks of `size` rows each — e.g. rows 10-205 at
+    size=100 becomes [(10,109),(110,205)]. Never drops a row: the last
+    block simply ends at the sheet's actual last data row."""
+    if not rows:
+        return []
+    lo, hi = min(rows), max(rows)
+    blocks = []
+    start = lo
+    while start <= hi:
+        end = min(start + size - 1, hi)
+        blocks.append((start, end))
+        start = end + 1
+    return blocks
+
+
+def _header_row_range(data_rows):
+    """Rows considered header/context rows for every block of a sheet: from
+    row 1 up to (but not including) the first data row. Always included in
+    every block's context so header/unit continuity survives the split."""
+    if not data_rows:
+        return (1, 0)
+    first = min(data_rows)
+    return (1, max(1, first - 1))
+
+
+def _merge_block_plans(sheet_name, block_plans):
+    """Combine several row-range blocks' plans for one sheet into a single
+    SHEET_PLAN-shaped dict, as if one call had declared the whole sheet.
+    Table row ranges are disjoint by construction (each block is validated
+    to stay within its own row range), so this is a plain concatenation."""
+    tables = [t for p in block_plans for t in p["tables"]]
+    excluded_areas = [a for p in block_plans for a in p["excluded_areas"]]
+    uncertainties = [u for p in block_plans for u in p["uncertainties"]]
+    kinds = Counter(p["kind"] for p in block_plans if p["kind"] not in {"unknown", "reference"})
+    kind = kinds.most_common(1)[0][0] if kinds else (block_plans[0]["kind"] if block_plans else "unknown")
+    return {"sheet": sheet_name, "kind": kind, "tables": tables,
+            "excluded_areas": excluded_areas, "uncertainties": uncertainties}
+
+
+# Bounded formula support for the auto-calculated-sheet recompute cross-check:
+# a single SUM() over one contiguous range, same-sheet or cross-sheet. Any
+# other formula shape (nested functions, multiple ranges, arithmetic between
+# cells, etc.) is deliberately left unsupported rather than guessed at.
+_SUM_RANGE_RE = re.compile(
+    r"^SUM\(\s*(?:(?:'(?P<qsheet>[^']+)'|(?P<sheet>[A-Za-z0-9_가-힣]+))!)?"
+    r"\$?(?P<c1>[A-Za-z]+)\$?(?P<r1>\d+):\$?(?P<c2>[A-Za-z]+)\$?(?P<r2>\d+)\s*\)$"
+)
+_MAX_CROSSCHECK_CELLS = 100_000
+
+
+def _recompute_sum_crosscheck(workbook, sheet, cell):
+    """Bounded, source-grounded sanity check for one auto-calculated sheet's
+    formula cell: does its cached result equal the sum of the RAW stored
+    values in the exact range its own formula references? This NEVER
+    produces or replaces an authoritative value — the record for this cell
+    stays unresolved/unmapped either way; it only attaches a diagnostic so a
+    stale or inconsistent cache is visible. Unsupported formula shapes,
+    missing/non-numeric caches and oversized ranges return None (no
+    diagnostic) rather than a guessed result.
+    """
+    formula = cell.get("formula") or {}
+    text = (formula.get("text") or "").lstrip("=").strip()
+    match = _SUM_RANGE_RE.match(text)
+    if not match:
+        return None
+    sheet_name = match.group("qsheet") or match.group("sheet") or sheet["name"]
+    target = next((s for s in workbook["sheets"] if s["name"] == sheet_name), None)
+    if target is None:
+        return {"status": "sheet_not_found", "referenced_sheet": sheet_name}
+    try:
+        col_a, col_b = column_number(match.group("c1").upper()), column_number(match.group("c2").upper())
+    except ValueError:
+        return {"status": "invalid_range", "referenced_sheet": sheet_name}
+    col_lo, col_hi = sorted((col_a, col_b))
+    row_lo, row_hi = sorted((int(match.group("r1")), int(match.group("r2"))))
+    referenced_range = f"{match.group('c1').upper()}{match.group('r1')}:{match.group('c2').upper()}{match.group('r2')}"
+    if (row_hi - row_lo + 1) * (col_hi - col_lo + 1) > _MAX_CROSSCHECK_CELLS:
+        return {"status": "range_too_large", "referenced_sheet": sheet_name, "referenced_range": referenced_range}
+    if formula.get("cached_status") != "stored_unverified" or cell.get("cached_value") is None:
+        return {"status": "no_cached_value_to_compare", "referenced_sheet": sheet_name, "referenced_range": referenced_range}
+    try:
+        cached_decimal = Decimal(str(cell["cached_value"]))
+    except InvalidOperation:
+        return {"status": "cached_value_not_numeric", "referenced_sheet": sheet_name, "referenced_range": referenced_range}
+    total = Decimal(0)
+    counted = 0
+    for c in target["cells"]:
+        if not (row_lo <= c["row"] <= row_hi and col_lo <= c["column_index"] <= col_hi):
+            continue
+        if not c.get("has_content", True) or c["data_type"] != "number":
+            continue
+        raw = c.get("cached_value") if c.get("formula") and c["formula"].get("cached_status") == "stored_unverified" else c.get("value")
+        if raw is None:
+            continue
+        try:
+            total += Decimal(str(raw))
+            counted += 1
+        except InvalidOperation:
+            return {"status": "non_numeric_in_range", "referenced_sheet": sheet_name, "referenced_range": referenced_range}
+    return {"status": "match" if total == cached_decimal else "mismatch", "referenced_sheet": sheet_name,
+            "referenced_range": referenced_range, "recomputed_sum": format(total, "f"),
+            "cached_value": format(cached_decimal, "f"), "cells_summed": counted}
 
 
 def _dynamic_refs(plan):
@@ -439,8 +628,16 @@ def _source_record(workbook, cell, table, row_rule, period_rule, unit_rule, inde
                                 "raw_record_id": cell["record_id"]}}
 
 
-def apply_plans(workbook, plans, *, reused_sheets=(), exception_resolutions=(), observed_rows=None, metadata=None):
-    """Expand bounded declarations over ALL numeric/formula candidates once."""
+def apply_plans(workbook, plans, *, reused_sheets=(), exception_resolutions=(), observed_rows=None,
+                metadata=None, formula_crosschecks=None):
+    """Expand bounded declarations over ALL numeric/formula candidates once.
+
+    formula_crosschecks, when given, is a {raw_record_id: crosscheck result}
+    map (see _recompute_sum_crosscheck) for cells in sheets that were never
+    sent to the LLM (see FORMULA_SKIP_RATIO). It only attaches a diagnostic;
+    it never changes a record's mapping/value — those stay unresolved for a
+    skipped sheet regardless of what the crosscheck finds.
+    """
     from .engine import submission_metadata, unresolved_records
     index = cell_index(workbook)
     submission = submission_metadata(metadata or {})
@@ -475,6 +672,19 @@ def apply_plans(workbook, plans, *, reused_sheets=(), exception_resolutions=(), 
             if not _candidate(cell, plan):
                 continue
             record = unresolved.get(cell["record_id"])
+            crosscheck = (formula_crosschecks or {}).get(cell["record_id"])
+            if crosscheck:
+                diagnostics.append({
+                    "code": f"FORMULA_RECOMPUTE_{crosscheck['status'].upper()}",
+                    "severity": "info" if crosscheck["status"] == "match" else "warning",
+                    "record_id": "standard:" + cell["record_id"],
+                    "message": "자동계산 시트로 분류되어 LLM 구조 해석을 생략함; 수식이 참조하는 범위의 원본 "
+                               "저장값 합계와 캐시된 계산값만 대조함(재계산 결과로 레코드 값을 바꾸지 않음)",
+                    "referenced_sheet": crosscheck.get("referenced_sheet"),
+                    "referenced_range": crosscheck.get("referenced_range"),
+                    "recomputed_sum": crosscheck.get("recomputed_sum"),
+                    "cached_value": crosscheck.get("cached_value"),
+                })
             if observed_rows is not None and sheet["name"] in observed_rows and cell["row"] not in observed_rows[sheet["name"]]:
                 if record is not None:
                     records.append(record)
@@ -554,13 +764,77 @@ def _template_contract():
                                      ensure_ascii=False, sort_keys=True).encode()).hexdigest()
 
 
+def _plan_from_blocks(workbook, sheet, client, review, blocks, header_range):
+    """Request structure one row-range block at a time instead of the whole
+    sheet, then merge the blocks back into one plan. Each block is its own
+    independent request and cache entry (different context => different
+    cache digest), per the existing PROMPT_VERSION+body sha256 caching."""
+    from .engine import infer
+    header_lo, header_hi = header_range
+    block_plans = []
+    for index, (lo, hi) in enumerate(blocks):
+        context = structure_context(workbook, sheet, row_range=(lo, hi), header_row_range=header_range)
+        prompt = PROMPT + BLOCK_NOTE.format(lo=lo, hi=hi, header_lo=header_lo, header_hi=header_hi)
+        result = infer(client, f"sheet_structure_v1_block{index}", prompt, context, PLAN_RESPONSE,
+                       lambda x, lo=lo, hi=hi: validate_plan(x["plan"], workbook, sheet, row_range=(lo, hi)),
+                       review=review)
+        block_plans.append(result["plan"])
+    merged = _merge_block_plans(sheet["name"], block_plans)
+    errors = validate_plan(merged, workbook, sheet)
+    if errors:
+        raise ValueError("merged block plan failed full-sheet validation: " + "; ".join(errors[:12]))
+    return merged
+
+
+def _resolve_sheet_plan(workbook, sheet, client, review, data_rows, timeout_fallbacks):
+    """Decide whole-sheet vs. row-range blocks for one sheet, and fall back
+    from a timed-out whole-sheet request to blocks instead of repeating the
+    identical oversized request.
+
+    Returns (plan, whole_sheet_context_or_None) — the context is returned
+    only when a whole-sheet call was actually made, so the caller can check
+    omitted_row_profiles for observed_rows; blocks never omit rows (each is
+    well under the 250-profile compression threshold), so there is nothing
+    to check in that case.
+    """
+    from .engine import infer
+    header_range = _header_row_range(data_rows)
+    if len(data_rows) > LARGE_SHEET_ROW_THRESHOLD:
+        return _plan_from_blocks(workbook, sheet, client, review, _row_blocks(data_rows), header_range), None
+    context = structure_context(workbook, sheet)
+    try:
+        # max_connection_attempts=1: fail fast on a timeout instead of the
+        # client's own default 2-same-payload-attempt retry — the fallback
+        # here is to shrink the request via blocks, not to resend it as-is.
+        result = infer(client, "sheet_structure_v1", PROMPT, context, PLAN_RESPONSE,
+                       lambda x: validate_plan(x["plan"], workbook, sheet), review=review,
+                       max_connection_attempts=1)
+        return result["plan"], context
+    except ModelError as error:
+        if not getattr(error, "connection_error", False):
+            raise
+        blocks = _row_blocks(data_rows)
+        original_bytes = len(json.dumps(context, ensure_ascii=False))
+        client._notify(f"[sheet_structure_v1] {sheet['name']}: 시간 초과로 같은 요청을 반복하지 않고 블록 단위로 축소 재시도 "
+                       f"— 원래 요청 크기 {original_bytes / 1024:.1f}KB → 블록 {len(blocks)}개(최대 {ROW_BLOCK_SIZE}행)")
+        plan = _plan_from_blocks(workbook, sheet, client, review, blocks, header_range)
+        timeout_fallbacks.append({"sheet": sheet["name"], "reason": "connection_timeout",
+                                  "original_request_bytes": original_bytes, "block_count": len(blocks),
+                                  "block_size_rows": ROW_BLOCK_SIZE})
+        return plan, None
+
+
 def infer_structure(workbook, client, *, review=False, max_exception_calls=0, metadata=None):
-    """One plan request per sheet, with conservative exact-structure reuse."""
+    """One plan request per sheet (or several row-range blocks for a large
+    one), with conservative exact-structure reuse. Formula-heavy
+    "auto-calculated" sheets are excluded from LLM interpretation entirely."""
     from .engine import infer
     plans = []
     reused = []
     observed_rows = {}
     failures = []
+    skipped_sheets = []
+    timeout_fallbacks = []
     events_before = len(client.events)
     template_dir = _template_dir(client)
     sheet_templates = []
@@ -578,9 +852,24 @@ def infer_structure(workbook, client, *, review=False, max_exception_calls=0, me
             plans.append({"sheet": sheet["name"], "kind": "reference", "tables": [], "excluded_areas": [],
                           "uncertainties": ["숫자·수식 후보 없음; 원본은 보존됨"]})
             continue
-        context = structure_context(workbook, sheet)
-        if context["omitted_row_profiles"]:
-            observed_rows[sheet["name"]] = {r["row"] for r in context["row_profiles"]}
+
+        formula_ratio = _formula_ratio(sheet)
+        if formula_ratio >= FORMULA_SKIP_RATIO:
+            # Auto-calculated sheet: no LLM call at all for this sheet. Its
+            # formula cells are cross-checked separately (see
+            # _recompute_sum_crosscheck) and stay unresolved/unmapped either
+            # way — this excluded_areas rectangle just keeps apply_plans
+            # from emitting a STRUCTURE_GAP diagnostic per candidate cell.
+            skipped_sheets.append({"sheet": sheet["name"], "formula_ratio": round(formula_ratio, 4),
+                                   "content_cells": len([c for c in sheet["cells"] if c.get("has_content", True)])})
+            plans.append({"sheet": sheet["name"], "kind": "reference", "tables": [],
+                          "excluded_areas": [{"start_row": 1, "end_row": 1_048_576, "start_col": "A", "end_col": "XFD",
+                                              "reason": f"자동계산 시트로 분류되어 구조 해석 생략(수식 비율 {formula_ratio:.3f} >= {FORMULA_SKIP_RATIO})",
+                                              "evidence": []}],
+                          "uncertainties": ["자동계산 시트로 분류되어 구조 해석을 생략함; 가능한 수식은 재계산 대조로 보완함"]})
+            continue
+
+        data_rows = sorted({c["row"] for c in candidates})
         plan = None
         for item in sheet_templates:
             candidate = item["plan"]
@@ -591,12 +880,19 @@ def infer_structure(workbook, client, *, review=False, max_exception_calls=0, me
                     break
         if plan is None:
             try:
-                result = infer(client, "sheet_structure_v1", PROMPT, context, PLAN_RESPONSE,
-                               lambda x: validate_plan(x["plan"], workbook, sheet), review=review)
-                plan = result["plan"]
+                plan, whole_context = _resolve_sheet_plan(workbook, sheet, client, review, data_rows, timeout_fallbacks)
             except Exception as error:
                 failures.append({"sheet": sheet["name"], "error_type": type(error).__name__, "message": str(error)})
-                break  # preserve completed plans/caches; no further requests
+                # A single sheet's failure (bad rectangle, grounding/coverage
+                # mismatch, etc.) is independent of every other sheet, so
+                # record it and keep going — unless the whole-file call
+                # budget is now exhausted, in which case no remaining sheet
+                # could afford a call either and we stop outright.
+                if getattr(client, "call_count", 0) >= getattr(client, "max_calls", float("inf")):
+                    break
+                continue
+            if whole_context is not None and whole_context["omitted_row_profiles"]:
+                observed_rows[sheet["name"]] = {r["row"] for r in whole_context["row_profiles"]}
             fingerprint = structure_fingerprint(workbook, plan)
             template_dir.mkdir(parents=True, exist_ok=True)
             path = template_dir / (_template_contract()[:16] + "-" + fingerprint + ".json")
@@ -634,10 +930,26 @@ def infer_structure(workbook, client, *, review=False, max_exception_calls=0, me
         except Exception:
             pass  # one bounded attempt; preserve exception regions unresolved
         exception_calls = len([e for e in client.events[events_before:] if e["task"].startswith("structure_exceptions") and not e["cached"]])
+
+    # Skipped (auto-calculated) sheets never got an LLM call, but their
+    # formula cells can still be sanity-checked against the raw values their
+    # own formula references — a bounded, source-grounded recompute, never
+    # an authoritative value (see _recompute_sum_crosscheck/apply_plans).
+    formula_crosschecks = {}
+    for skip in skipped_sheets:
+        sheet = next(s for s in workbook["sheets"] if s["name"] == skip["sheet"])
+        for cell in sheet["cells"]:
+            if cell.get("has_content", True) and cell.get("formula"):
+                result = _recompute_sum_crosscheck(workbook, sheet, cell)
+                if result:
+                    formula_crosschecks[cell["record_id"]] = result
+
     mapped = apply_plans(workbook, plans, reused_sheets=reused, exception_resolutions=resolutions,
-                         observed_rows=observed_rows, metadata=metadata)
+                         observed_rows=observed_rows, metadata=metadata, formula_crosschecks=formula_crosschecks)
     semantic = {"structure_plans": plans, "reused_sheets": reused,
                 "failures": failures,
+                "skipped_sheets": skipped_sheets,
+                "timeout_fallbacks": timeout_fallbacks,
                 "structure_calls": len([e for e in client.events[events_before:] if not e["cached"]]),
                 "exception_calls": exception_calls, "max_exception_calls": max_exception_calls,
                 "unresolved_candidates": sum(r["mapping"]["status"] != "mapped" for r in mapped["records"])}

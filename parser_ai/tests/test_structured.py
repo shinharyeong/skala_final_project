@@ -3,6 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from excel_parser_ai.client import ModelError
 from excel_parser_ai.structured import apply_plans, infer_structure, structure_fingerprint, validate_plan
 
 
@@ -190,7 +191,7 @@ class StructureApplicationTests(unittest.TestCase):
         class FakeClient:
             def __init__(self, cache):
                 self.cache_dir, self.events, self.calls = cache, [], 0
-            def ask(self, task, prompt, context, schema):
+            def ask(self, task, prompt, context, schema, **kwargs):
                 self.calls += 1
                 self.events.append({"task": task, "cached": False})
                 return {"plan": plan()}
@@ -211,7 +212,7 @@ class StructureApplicationTests(unittest.TestCase):
         class FakeClient:
             def __init__(self, path):
                 self.cache_dir, self.events, self.calls = path, [], []
-            def ask(self, task, prompt, context, schema):
+            def ask(self, task, prompt, context, schema, **kwargs):
                 self.calls.append(task)
                 self.events.append({"task": task, "cached": False})
                 if task == "sheet_structure_v1":
@@ -233,7 +234,7 @@ class StructureApplicationTests(unittest.TestCase):
         class FailingClient:
             def __init__(self, path):
                 self.cache_dir, self.events, self.calls = path, [], 0
-            def ask(self, task, prompt, context, schema):
+            def ask(self, task, prompt, context, schema, **kwargs):
                 self.calls += 1
                 raise RuntimeError("mock failure")
         with tempfile.TemporaryDirectory() as tmp:
@@ -251,7 +252,7 @@ class StructureApplicationTests(unittest.TestCase):
         class FakeClient:
             def __init__(self, path):
                 self.cache_dir, self.events, self.calls = path, [], 0
-            def ask(self, task, prompt, context, schema):
+            def ask(self, task, prompt, context, schema, **kwargs):
                 self.calls += 1
                 self.events.append({"task": task, "cached": False})
                 return {"plan": plan()}
@@ -260,6 +261,378 @@ class StructureApplicationTests(unittest.TestCase):
             _, semantic = infer_structure(workbook, client)
             self.assertEqual(client.calls, 1)
             self.assertEqual(len(semantic["structure_plans"]), 2)
+
+
+def sheet_cells(name, cells):
+    return [dict(c, sheet=name) for c in cells]
+
+
+def big_sheet_fixture(num_rows):
+    """A tall detail table: header rows 1-2, then `num_rows` data rows each
+    with one numeric cell in column B. Used to exercise row-range-block
+    splitting (both proactive, for large sheets, and reactive, after a
+    simulated timeout on a smaller one)."""
+    cells = [cell("B1", "2025년 1월"), cell("B2", "실적")]
+    for row in range(3, 3 + num_rows):
+        cells.append(cell(f"A{row}", f"항목{row}"))
+        cells.append(cell(f"B{row}", str(row), "number"))
+    return {"file": {"file_id": "file", "source_id": "source", "path": "/mock.xlsx", "name": "mock.xlsx"},
+            "sheets": [{"name": "Sheet", "dimension": f"A1:B{2 + num_rows}", "merges": [], "cells": cells, "state": "visible"}],
+            "diagnostics": []}
+
+
+def block_plan(lo, hi):
+    """A minimal, valid single-table plan declaring exactly rows [lo, hi] of
+    column B in big_sheet_fixture — what a real model would return for one
+    row-range block request."""
+    ref = {"sheet": "Sheet", "cell": "B1"}
+    return {"sheet": "Sheet", "kind": "financial_statement",
+            "tables": [{"start_row": lo, "end_row": hi, "start_col": "B", "end_col": "B",
+                       "header_start_row": 1, "header_end_row": 2,
+                       "organization_code_col": None, "organization_name_col": None,
+                       "organization_code_ref": ref, "organization_name_ref": ref,
+                       "periods": [{"start_col": "B", "end_col": "B", "year": 2025, "year_ref": ref,
+                                   "aggregation": "month", "month_header_row": 1, "start_month": 1,
+                                   "scenario": "actual", "scenario_ref": {"sheet": "Sheet", "cell": "B2"},
+                                   "evidence": [ref, {"sheet": "Sheet", "cell": "B2"}]}],
+                       "rows": [{"start_row": lo, "end_row": hi, "role": "detail", "item_col": "A",
+                                "item_code_col": None, "hierarchy_cols": [], "ancestor_rows": [],
+                                "metric_code": None, "reason": "labels"}],
+                       "unit": "원", "normalization_mode": "amount_to_won", "unit_evidence": [ref],
+                       "unit_overrides": [], "exclusions": [], "exceptions": []}],
+            "excluded_areas": [], "uncertainties": []}
+
+
+class LargeSheetBlockSplittingTests(unittest.TestCase):
+    """Covers requirement 2: a sheet with more data rows than
+    LARGE_SHEET_ROW_THRESHOLD is split into row-range blocks instead of one
+    whole-sheet call."""
+
+    def test_large_sheet_is_split_into_multiple_block_requests(self):
+        workbook = big_sheet_fixture(num_rows=160)  # > LARGE_SHEET_ROW_THRESHOLD (150)
+
+        class BlockAwareClient:
+            def __init__(self, cache_dir):
+                self.cache_dir, self.events, self.calls = cache_dir, [], []
+            def ask(self, task, prompt, context, schema, **kwargs):
+                self.calls.append(task)
+                self.events.append({"task": task, "cached": False})
+                lo, hi = context["declared_row_range"]
+                return {"plan": block_plan(lo, hi)}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            client = BlockAwareClient(Path(tmp))
+            mapped, semantic = infer_structure(workbook, client)
+
+        self.assertNotIn("sheet_structure_v1", client.calls)  # never sent as one whole-sheet call
+        block_calls = [t for t in client.calls if t.startswith("sheet_structure_v1_block")]
+        self.assertGreaterEqual(len(block_calls), 2)  # 160 rows / 100-row blocks
+        self.assertEqual(sum(1 for r in mapped["records"] if r["mapping"]["status"] == "mapped"), 160)
+        self.assertEqual(mapped["diagnostics"], [])  # merged blocks give full, gapless coverage
+
+    def test_small_sheet_is_not_split(self):
+        workbook = big_sheet_fixture(num_rows=5)  # well under the threshold
+
+        class WholeSheetClient:
+            def __init__(self, cache_dir):
+                self.cache_dir, self.events, self.calls = cache_dir, [], []
+            def ask(self, task, prompt, context, schema, **kwargs):
+                self.calls.append(task)
+                self.events.append({"task": task, "cached": False})
+                return {"plan": block_plan(3, 7)}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            client = WholeSheetClient(Path(tmp))
+            infer_structure(workbook, client)
+        self.assertEqual(client.calls, ["sheet_structure_v1"])
+
+
+class FormulaHeavySheetSkipTests(unittest.TestCase):
+    """Covers requirement 1: a sheet whose formula ratio is at/above
+    FORMULA_SKIP_RATIO never gets an LLM call, and its SUM formulas are
+    cross-checked against the raw values they actually reference instead."""
+
+    def _workbook(self, *, matching=True):
+        detail = sheet_cells("Detail", [cell("C10", "100", "number"), cell("C11", "200", "number")])
+        match_formula = {"text": "=SUM(Detail!C10:C11)", "cached_status": "stored_unverified"}
+        bad_formula = {"text": "=SUM(Detail!C10:C11)", "cached_status": "stored_unverified"}
+        summary = sheet_cells("Summary", [
+            cell("D5", "300" if matching else "300", "number", formula=match_formula),
+            cell("D6", "999", "number", formula=bad_formula),
+            cell("E1", "레이블"),
+        ])
+        return {"file": {"file_id": "f", "source_id": "s", "path": "/m.xlsx", "name": "m.xlsx"},
+               "sheets": [{"name": "Detail", "dimension": "C10:C11", "merges": [], "cells": detail, "state": "visible"},
+                          {"name": "Summary", "dimension": "D5:E1", "merges": [], "cells": summary, "state": "visible"}],
+               "diagnostics": []}
+
+    def test_formula_heavy_sheet_gets_no_llm_call_and_is_recorded_as_skipped(self):
+        workbook = self._workbook()
+        ref = {"sheet": "Detail", "cell": "C10"}
+
+        class DetailOnlyClient:
+            def __init__(self, cache_dir):
+                self.cache_dir, self.events, self.calls = cache_dir, [], []
+            def ask(self, task, prompt, context, schema, **kwargs):
+                self.calls.append(task)
+                self.events.append({"task": task, "cached": False})
+                return {"plan": {"sheet": context["sheet"], "kind": "revenue_detail",
+                                 "tables": [{"start_row": 10, "end_row": 11, "start_col": "C", "end_col": "C",
+                                            "header_start_row": 1, "header_end_row": 1,
+                                            "organization_code_col": None, "organization_name_col": None,
+                                            "organization_code_ref": ref, "organization_name_ref": ref,
+                                            "periods": [{"start_col": "C", "end_col": "C", "year": 2025, "year_ref": ref,
+                                                        "aggregation": "annual", "month_header_row": None, "start_month": None,
+                                                        "scenario": "actual", "scenario_ref": ref, "evidence": [ref]}],
+                                            "rows": [{"start_row": 10, "end_row": 11, "role": "detail", "item_col": None,
+                                                     "item_code_col": None, "hierarchy_cols": [], "ancestor_rows": [],
+                                                     "metric_code": None, "reason": "x"}],
+                                            "unit": "원", "normalization_mode": "amount_to_won", "unit_evidence": [ref],
+                                            "unit_overrides": [], "exclusions": [], "exceptions": []}],
+                                 "excluded_areas": [], "uncertainties": []}}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            client = DetailOnlyClient(Path(tmp))
+            mapped, semantic = infer_structure(workbook, client)
+
+        # Only Detail (formula_ratio 0.0) was ever asked; Summary (ratio
+        # 2/3 >= 0.3) got no LLM call at all.
+        self.assertEqual(client.calls, ["sheet_structure_v1"])
+        self.assertEqual(len(semantic["skipped_sheets"]), 1)
+        self.assertEqual(semantic["skipped_sheets"][0]["sheet"], "Summary")
+        self.assertGreaterEqual(semantic["skipped_sheets"][0]["formula_ratio"], 0.3)
+
+    def test_matching_and_mismatching_sum_formulas_are_crosschecked_without_changing_records(self):
+        workbook = self._workbook()
+
+        class DetailOnlyClient:
+            def __init__(self, cache_dir):
+                self.cache_dir, self.events = cache_dir, []
+            def ask(self, task, prompt, context, schema, **kwargs):
+                self.events.append({"task": task, "cached": False})
+                ref = {"sheet": "Detail", "cell": "C10"}
+                return {"plan": {"sheet": context["sheet"], "kind": "revenue_detail",
+                                 "tables": [{"start_row": 10, "end_row": 11, "start_col": "C", "end_col": "C",
+                                            "header_start_row": 1, "header_end_row": 1,
+                                            "organization_code_col": None, "organization_name_col": None,
+                                            "organization_code_ref": ref, "organization_name_ref": ref,
+                                            "periods": [{"start_col": "C", "end_col": "C", "year": 2025, "year_ref": ref,
+                                                        "aggregation": "annual", "month_header_row": None, "start_month": None,
+                                                        "scenario": "actual", "scenario_ref": ref, "evidence": [ref]}],
+                                            "rows": [{"start_row": 10, "end_row": 11, "role": "detail", "item_col": None,
+                                                     "item_code_col": None, "hierarchy_cols": [], "ancestor_rows": [],
+                                                     "metric_code": None, "reason": "x"}],
+                                            "unit": "원", "normalization_mode": "amount_to_won", "unit_evidence": [ref],
+                                            "unit_overrides": [], "exclusions": [], "exceptions": []}],
+                                 "excluded_areas": [], "uncertainties": []}}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            client = DetailOnlyClient(Path(tmp))
+            mapped, semantic = infer_structure(workbook, client)
+
+        diagnostics_by_cell = {d["record_id"]: d for d in mapped["diagnostics"] if d.get("code", "").startswith("FORMULA_RECOMPUTE")}
+        d5 = next(r for r in mapped["records"] if r["source"]["cell"] == "D5")
+        d6 = next(r for r in mapped["records"] if r["source"]["cell"] == "D6")
+        self.assertEqual(diagnostics_by_cell[d5["record_id"]]["code"], "FORMULA_RECOMPUTE_MATCH")   # 100+200 == 300
+        self.assertEqual(diagnostics_by_cell[d6["record_id"]]["code"], "FORMULA_RECOMPUTE_MISMATCH")  # 100+200 != 999
+        # The crosscheck is diagnostic-only: skipped-sheet records never
+        # become mapped/confirmed, no matter what the recompute found.
+        for record in (d5, d6):
+            self.assertEqual(record["mapping"]["status"], "unmapped")
+            self.assertIsNone(record["value"]["normalized_value"])
+
+
+class TimeoutFallbackTests(unittest.TestCase):
+    """Covers requirement 3: a connection-class timeout on a whole-sheet
+    request is NOT retried with the same payload — it falls back to
+    smaller row-range blocks, and the size reduction is logged."""
+
+    def test_timeout_falls_back_to_blocks_instead_of_repeating_the_same_request(self):
+        workbook = big_sheet_fixture(num_rows=120)  # under the threshold: whole-sheet is attempted first
+
+        class TimeoutThenBlocksClient:
+            def __init__(self, cache_dir):
+                self.cache_dir, self.events, self.calls, self.notifications = cache_dir, [], [], []
+            def _notify(self, message):
+                self.notifications.append(message)
+            def ask(self, task, prompt, context, schema, **kwargs):
+                self.calls.append(task)
+                if task == "sheet_structure_v1":
+                    raise ModelError("simulated timeout", connection_error=True)
+                self.events.append({"task": task, "cached": False})
+                lo, hi = context["declared_row_range"]
+                return {"plan": block_plan(lo, hi)}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            client = TimeoutThenBlocksClient(Path(tmp))
+            mapped, semantic = infer_structure(workbook, client)
+
+        # The whole-sheet request was attempted exactly once — not repeated
+        # as-is after the timeout.
+        self.assertEqual(client.calls.count("sheet_structure_v1"), 1)
+        block_calls = [t for t in client.calls if t.startswith("sheet_structure_v1_block")]
+        self.assertGreaterEqual(len(block_calls), 2)  # 120 rows / 100-row blocks -> smaller requests
+        self.assertEqual(len(semantic["timeout_fallbacks"]), 1)
+        fallback = semantic["timeout_fallbacks"][0]
+        self.assertEqual(fallback["sheet"], "Sheet")
+        self.assertGreater(fallback["original_request_bytes"], 0)
+        self.assertEqual(fallback["block_count"], len(block_calls))
+        self.assertTrue(any("블록" in message and "KB" in message for message in client.notifications))
+        self.assertEqual(sum(1 for r in mapped["records"] if r["mapping"]["status"] == "mapped"), 120)
+
+    def test_non_connection_errors_are_not_treated_as_a_shrink_opportunity(self):
+        # An HTTP-error-class ModelError (connection_error=False, the
+        # default) must propagate normally — only a genuine connection
+        # timeout triggers the block fallback.
+        workbook = big_sheet_fixture(num_rows=5)
+
+        class HttpErrorClient:
+            def __init__(self, cache_dir):
+                self.cache_dir, self.events = cache_dir, []
+            def ask(self, task, prompt, context, schema, **kwargs):
+                raise ModelError("simulated HTTP 403")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            client = HttpErrorClient(Path(tmp))
+            mapped, semantic = infer_structure(workbook, client)
+        self.assertEqual(len(semantic["failures"]), 1)
+        self.assertEqual(semantic["timeout_fallbacks"], [])
+
+
+def plan_for(sheet_name):
+    """plan(), retargeted (table + every {sheet, cell} pointer) to a
+    different sheet name — for building multi-sheet fixtures."""
+    def retarget(value):
+        if isinstance(value, dict):
+            if set(value) == {"sheet", "cell"}:
+                value["sheet"] = sheet_name
+            else:
+                for child in value.values():
+                    retarget(child)
+        elif isinstance(value, list):
+            for child in value:
+                retarget(child)
+    declaration = copy.deepcopy(plan())
+    declaration["sheet"] = sheet_name
+    retarget(declaration)
+    return declaration
+
+
+def two_sheet_fixture():
+    """Two independent sheets, each shaped like fixture()'s single sheet,
+    so each needs its own structure-interpretation call."""
+    workbook = fixture()
+    sheet_one = dict(workbook["sheets"][0], name="SheetOne",
+                      cells=sheet_cells("SheetOne", workbook["sheets"][0]["cells"]))
+    other = fixture()["sheets"][0]
+    sheet_two = dict(other, name="SheetTwo", cells=sheet_cells("SheetTwo", other["cells"]))
+    return {"file": workbook["file"], "sheets": [sheet_one, sheet_two], "diagnostics": []}
+
+
+class PerSheetIndependentFailureTests(unittest.TestCase):
+    """infer_structure() must not let one sheet's final failure stop every
+    other sheet from being attempted — only a now-exhausted call budget
+    should do that (see structured.py's main per-sheet loop)."""
+
+    def test_one_sheets_failure_does_not_block_the_next_sheets_attempt(self):
+        workbook = two_sheet_fixture()
+
+        class PartiallyFailingClient:
+            def __init__(self, cache_dir):
+                self.cache_dir, self.events, self.attempted = cache_dir, [], []
+
+            def ask(self, task, prompt, context, schema, **kwargs):
+                self.attempted.append(context["sheet"])
+                self.events.append({"task": task, "cached": False})
+                if context["sheet"] == "SheetOne":
+                    raise RuntimeError("mock sheet-specific failure")
+                return {"plan": plan_for("SheetTwo")}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            client = PartiallyFailingClient(Path(tmp))
+            mapped, semantic = infer_structure(workbook, client)
+
+        # Both sheets were attempted — SheetTwo was not skipped just
+        # because SheetOne failed first.
+        self.assertEqual(client.attempted, ["SheetOne", "SheetTwo"])
+        self.assertEqual(len(semantic["failures"]), 1)
+        self.assertEqual(semantic["failures"][0]["sheet"], "SheetOne")
+        self.assertEqual(len(semantic["structure_plans"]), 1)
+        self.assertEqual(semantic["structure_plans"][0]["sheet"], "SheetTwo")
+        sheet_one_records = [r for r in mapped["records"] if r["source"]["sheet"] == "SheetOne"]
+        sheet_two_records = [r for r in mapped["records"] if r["source"]["sheet"] == "SheetTwo"]
+        self.assertTrue(all(r["mapping"]["status"] == "unmapped" for r in sheet_one_records))
+        self.assertTrue(any(r["mapping"]["status"] == "mapped" for r in sheet_two_records))
+
+    def test_budget_exhaustion_stops_remaining_sheets_without_attempting_them(self):
+        workbook = two_sheet_fixture()
+
+        class BudgetedClient:
+            """Mimics ResponsesClient's call_count/max_calls bookkeeping
+            closely enough to exercise the budget-aware break: the cap is
+            reached by the first (failing) call, so the second sheet must
+            never even be attempted."""
+            max_calls = 1
+
+            def __init__(self, cache_dir):
+                self.cache_dir, self.events, self.attempted, self.call_count = cache_dir, [], [], 0
+
+            def ask(self, task, prompt, context, schema, **kwargs):
+                self.attempted.append(context["sheet"])
+                self.call_count += 1
+                self.events.append({"task": task, "cached": False})
+                raise RuntimeError("mock failure that exhausts the budget")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            client = BudgetedClient(Path(tmp))
+            mapped, semantic = infer_structure(workbook, client)
+
+        self.assertEqual(client.attempted, ["SheetOne"])  # SheetTwo never attempted
+        self.assertEqual(len(semantic["failures"]), 1)
+        self.assertEqual(semantic["structure_plans"], [])
+
+
+class RectangleValidationMessageTests(unittest.TestCase):
+    """The 'start_row must equal header_end_row + 1' mistake (observed in a
+    real run against 매출_세부_IFRS15後, where the model repeated the exact
+    same off-by-two rectangle on repair) must produce a specific, numeric
+    error — not the old generic 'invalid table/header rectangle' bucket
+    message — so a repair retry has an actionable signal to correct it."""
+
+    def test_start_row_equal_to_header_start_row_gets_a_specific_actionable_message(self):
+        # Reproduces the real failure shape seen against 매출_세부_IFRS15後:
+        # a multi-row header (header_start_row < header_end_row) where the
+        # model set start_row equal to header_start_row instead of
+        # header_end_row + 1 — both the first LLM response and its repair
+        # made this exact mistake.
+        workbook, declaration = fixture(), plan()
+        table = declaration["tables"][0]
+        table["start_row"] = table["header_start_row"]  # 1, instead of 3
+        errors = validate_plan(declaration, workbook, workbook["sheets"][0])
+        self.assertFalse(any(e == "invalid table/header rectangle" for e in errors))
+        specific = [e for e in errors if "header_end_row" in e and "start_row" in e]
+        self.assertTrue(specific, f"expected a specific header_end_row/start_row message, got: {errors}")
+        self.assertIn("(1)", specific[0])
+        self.assertIn("merged", specific[0].lower())
+
+    def test_correcting_start_row_to_header_end_row_plus_one_resolves_it(self):
+        workbook, declaration = fixture(), plan()
+        table = declaration["tables"][0]
+        table["start_row"] = table["header_start_row"]  # the broken declaration
+        self.assertTrue(validate_plan(declaration, workbook, workbook["sheets"][0]))
+        table["start_row"] = table["header_end_row"] + 1  # the fix: back to 3
+        self.assertEqual(validate_plan(declaration, workbook, workbook["sheets"][0]), [])
+
+    def test_reversed_row_and_column_bounds_get_distinct_specific_messages(self):
+        workbook, declaration = fixture(), plan()
+        declaration["tables"][0]["end_row"] = 2  # now < start_row (3)
+        errors = validate_plan(declaration, workbook, workbook["sheets"][0])
+        self.assertTrue(any("end_row" in e and "start_row" in e and "(2)" in e for e in errors))
+
+        workbook, declaration = fixture(), plan()
+        declaration["tables"][0]["start_col"], declaration["tables"][0]["end_col"] = "C", "B"
+        errors = validate_plan(declaration, workbook, workbook["sheets"][0])
+        self.assertTrue(any("end_col" in e and "start_col" in e for e in errors))
 
 
 if __name__ == "__main__":

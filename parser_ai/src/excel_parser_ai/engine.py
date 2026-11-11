@@ -220,18 +220,23 @@ def row_errors(result, workbook, sheet, plan, required):
     return errors
 
 
-def infer(client, task, prompt, context, schema, validator, *, review=True):
-    proposal = client.ask(task, prompt, context, schema)
+def infer(client, task, prompt, context, schema, validator, *, review=True, max_connection_attempts=None):
+    # max_connection_attempts is only ever forwarded when a caller explicitly
+    # passes it (e.g. structured.py's whole-sheet-then-blocks timeout
+    # fallback) — omitted entirely otherwise, so existing test doubles with
+    # a plain ask(task, prompt, context, schema) signature are unaffected.
+    ask_kwargs = {"max_connection_attempts": max_connection_attempts} if max_connection_attempts is not None else {}
+    proposal = client.ask(task, prompt, context, schema, **ask_kwargs)
     errors = validator(proposal)
     if errors:
         proposal = client.ask(task + "_repair", prompt + "\nRepair the validation errors using the original source. Do not hide missing rows.",
-                              {"source": context, "proposal": proposal, "validation_errors": errors[:80]}, schema)
+                              {"source": context, "proposal": proposal, "validation_errors": errors[:80]}, schema, **ask_kwargs)
         errors = validator(proposal)
     if errors:
         raise ValueError("LLM output failed grounding/coverage validation: " + "; ".join(errors[:12]))
     if review:
         reviewed = client.ask(task + "_review", prompt + "\nAct as an independent semantic reviewer. Read the source first. Check year/scenario, month vs annual, units, codes vs amounts, subtotal/detail, sign/percent handling and source evidence for every cell. Return the full corrected object. Ground every change. Do not assume the proposal is correct.",
-                              {"source": context, "proposal_to_audit": proposal}, schema)
+                              {"source": context, "proposal_to_audit": proposal}, schema, **ask_kwargs)
         errors = validator(reviewed)
         if errors:
             # A broken critic response must never replace a grounded proposal or

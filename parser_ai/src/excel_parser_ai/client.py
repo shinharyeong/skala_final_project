@@ -29,7 +29,12 @@ CONNECTION_RETRY_MAX_ATTEMPTS = 2
 
 
 class ModelError(RuntimeError):
-    pass
+    def __init__(self, message, *, connection_error=False):
+        """connection_error marks a timeout/connection-class failure (vs. an
+        HTTP error response) so a caller can choose to fall back to a
+        smaller request instead of blindly repeating the same oversized one."""
+        super().__init__(message)
+        self.connection_error = connection_error
 
 
 def _error_detail(http_error, model):
@@ -103,6 +108,14 @@ class ResponsesClient:
     def _task_label(self):
         return getattr(self._context, "task", "request")
 
+    def _max_connection_attempts(self):
+        # Absent (direct _request() call, e.g. in tests) or explicitly None
+        # (ask() called without an override) both fall back to the module
+        # default — only a caller that deliberately wants fast-fail-then-
+        # fallback behavior (see structured.py's whole-sheet-then-blocks
+        # retry) passes a smaller value through ask().
+        return getattr(self._context, "max_connection_attempts", None) or CONNECTION_RETRY_MAX_ATTEMPTS
+
     def _request(self, body):
         key = os.getenv("OPENAI_API_KEY")
         if not key:
@@ -111,12 +124,13 @@ class ResponsesClient:
             "https://api.openai.com/v1/responses", data=json.dumps(body).encode(),
             headers={"Authorization": "Bearer " + key, "Content-Type": "application/json"}, method="POST")
         task = self._task_label()
+        max_connection_attempts = self._max_connection_attempts()
         http_attempt = 0
         connection_attempt = 0
         while True:
             start = time.monotonic()
             self._notify(f"[{task}] 요청 전송 (http 시도 {http_attempt + 1}/{HTTP_RETRY_MAX_ATTEMPTS}, "
-                        f"연결 시도 {connection_attempt + 1}/{CONNECTION_RETRY_MAX_ATTEMPTS}, "
+                        f"연결 시도 {connection_attempt + 1}/{max_connection_attempts}, "
                         f"모델={self.model}, timeout={self.timeout:.0f}s)")
             try:
                 with self.lock:
@@ -154,18 +168,19 @@ class ResponsesClient:
                 connection_attempt += 1
                 closed_mid_response = isinstance(error, (ConnectionError, http.client.IncompleteRead))
                 kind = "연결이 응답 중간에 끊김" if closed_mid_response else "연결 실패 또는 응답 시간 초과"
-                if connection_attempt >= CONNECTION_RETRY_MAX_ATTEMPTS:
+                if connection_attempt >= max_connection_attempts:
                     self._notify(f"[{task}] {kind}로 중단 ({elapsed:.1f}s 경과, timeout={self.timeout:.0f}s, {type(error).__name__})")
                     raise ModelError(
                         f"OpenAI {kind}({elapsed:.1f}s, timeout={self.timeout:.0f}s, 모델={self.model}, "
                         f"오류 종류={type(error).__name__}). 같은 요청을 반복 재시도해 비용을 늘리지 않도록 연결 재시도 "
                         "횟수를 제한했습니다. 이미 진행 중이던 요청 자체를 강제로 취소할 수는 없습니다(표준 라이브러리 제약). "
-                        "네트워크 연결, PARSER_AI_TIMEOUT_SECONDS, 입력 크기를 확인하세요."
+                        "네트워크 연결, PARSER_AI_TIMEOUT_SECONDS, 입력 크기를 확인하세요.",
+                        connection_error=True,
                     ) from None
                 self._notify(f"[{task}] {kind}로 재시도 예정 ({elapsed:.1f}s 경과, {type(error).__name__})")
                 time.sleep(2 ** connection_attempt + random.random())
 
-    def ask(self, task, instructions, context, schema, *, refresh=False):
+    def ask(self, task, instructions, context, schema, *, refresh=False, max_connection_attempts=None):
         body = {
             "model": self.model, "store": False,
             "reasoning": {"effort": self.effort},
@@ -189,6 +204,7 @@ class ResponsesClient:
             self.call_count += 1
             call_number = self.call_count
         self._context.task = task
+        self._context.max_connection_attempts = max_connection_attempts
         self._notify(f"[{task}] 처리 시작 (누적 호출 {call_number}/{self.max_calls}, 요청 크기 {len(encoded) / 1024:.1f}KB)")
         start = time.monotonic()
         try:

@@ -77,3 +77,8 @@ PYTHONPATH=parser_ai/src python3 -B -m unittest discover -s parser_ai/tests -v
 ## 이전 셀별 실험
 
 `--engine legacy-cell`은 이전 결과 재현용이다. 이 모드만 `--batch-size`, `--max-batch-cells`, `--max-batch-bytes`, `--max-new-row-batches`를 사용한다. 이전 셀별 모드의 성공 캐시와 실행 결과는 보존되어 있다. 새 비교와 이후 실행의 기본값은 `structure`다.
+
+## 더 자세한 문서
+
+- [실행 중 겪은 문제와 조치](docs/development/troubleshooting.md)
+- [구현·검증 상태와 변경 기록](IMPLEMENTATION_STATUS.md)
