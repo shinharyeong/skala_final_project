@@ -1,0 +1,21 @@
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# 환경 변수·비밀 정보
+.env
+.env.*
+!.env.example
+
+# 로그
+*.log
+
+# 입력 데이터·실행 결과 (저장소에 포함하지 않음)
+Data/
+output/
+logs/

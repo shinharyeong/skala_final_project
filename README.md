@@ -1,26 +1,34 @@
 # skala_final_project
 
-## 엑셀 데이터 파싱
+SKALA 최종 프로젝트 모노레포입니다.
 
-경영기획용 엑셀에서 원본 값과 구조를 보존하고, 조직·항목·기간·단위가 연결된 표준 레코드를 만드는 Python 모듈입니다. 코드는 [`parser/`](parser/)에서 관리합니다. 입력 데이터와 실행 결과는 저장소에 포함하지 않습니다.
+## 폴더 구조
 
-### 파서 구성
+| 폴더 | 내용 | 기술 |
+| --- | --- | --- |
+| [`frontend/`](frontend/) | 웹 프론트엔드 | Vue 3, Vite, Vue Router, Pinia |
+| [`backend/`](backend/) | API 서버 | Spring Boot 3.4, Java 21, Gradle |
+| [`ai/`](ai/) | AI 기능 | FastAPI, LangChain (구성 예정) |
+| [`parser/`](parser/) | 경영기획 Excel 파싱·검증 | Python 3.11+ (표준 라이브러리) |
+| [`docs/`](docs/) | 공통 문서 | |
 
-| 구성 | 처리 내용 |
-| --- | --- |
-| 원본 추출 | 모든 시트의 셀 값·수식·저장 캐시·숨김·병합·서식·메모 보존 |
-| 숫자 정규화 | Decimal 기반 부호·통화·단위·비율 처리와 미확정 값 구분 |
-| 의미 매핑 | 원본 헤더와 코드표를 근거로 조직·항목·기간·추가 차원 연결 |
-| 표준 결과 | 원본 셀 출처를 포함한 JSON/JSONL과 파일·시트별 진단 제공 |
+## 로컬 실행
 
-### 검증 방법
+각 영역은 독립적으로 실행합니다. 자세한 내용은 폴더별 README를 참고하세요.
 
-1. **원본 대조:** 별도 OOXML 점검 코드로 파일·시트·셀 주소·저장값·수식·캐시를 비교합니다.
-2. **출처 검증:** 표준 레코드의 파일·시트·셀 참조와 원문 보존, 숫자·수식 후보 누락을 확인합니다.
-3. **숫자 경계 검증:** 부호·괄호·Unicode·단위·비율·코드·날짜·빈 값·수식 캐시를 독립 기대값으로 검사합니다.
-4. **집계 비교:** 별도로 제공된 조직 원본과 마스터가 있으면 지원하는 SUMIFS·차감 구조를 독립 계산해 비교합니다.
-5. **원본 보호:** 실행 전후 SHA-256을 비교하고, 저장 요청이 없는 실행의 파일 쓰기를 차단합니다.
+```bash
+# frontend — Node.js 20.19+
+cd frontend && npm install && npm run dev        # http://localhost:5173
 
-원본 보존과 업무 의미의 정확성은 구분합니다. 수식은 저장 캐시를 읽으며 Excel을 재계산하지 않습니다. `mapped`·`confirmed`는 규칙 적용 상태이고 독립적인 정답률이 아닙니다. DB·웹 API·업로드·승인·공식 마스터 발행 기능은 포함하지 않습니다.
+# backend — JDK 21
+cd backend && ./gradlew bootRun                  # http://localhost:8080
 
-실행 방법과 테스트 구분은 [파서 README](parser/README.md), 결과 필드와 타입은 [출력 계약](parser/docs/development/output-contract.md)을 참고하세요.
+# parser — Python 3.11+
+cd parser && PYTHONPATH=src python3 -B -m unittest discover -s tests -v
+```
+
+## 협업 규칙
+
+브랜치 전략, 커밋·이슈·PR 규칙은 [CONTRIBUTING.md](CONTRIBUTING.md)를 따릅니다.
+
+입력 데이터, 실행 결과, `.env` 등 비밀 정보는 커밋하지 않습니다.
