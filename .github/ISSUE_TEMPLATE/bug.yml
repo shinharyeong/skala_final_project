@@ -1,0 +1,49 @@
+name: 버그
+description: 의도와 다르게 동작하는 문제
+title: "[fix] "
+labels: ["bug"]
+body:
+  - type: dropdown
+    id: area
+    attributes:
+      label: 영역
+      options:
+        - fe
+        - be
+        - ai
+        - parser
+        - docs
+        - common (루트 설정 / 여러 영역)
+    validations:
+      required: true
+  - type: textarea
+    id: summary
+    attributes:
+      label: 현상
+      description: 어떤 문제가 발생하나요?
+    validations:
+      required: true
+  - type: textarea
+    id: location
+    attributes:
+      label: 위치
+      description: 관련 파일·함수·라인
+      placeholder: parser/src/excel_parser/validation.py L752 (compare_master)
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: 재현 방법
+      description: 입력, 실행 명령, 순서
+      placeholder: |
+        1.
+        2.
+  - type: textarea
+    id: expected
+    attributes:
+      label: 기대 결과 / 실제 결과
+    validations:
+      required: true
+  - type: textarea
+    id: suggestion
+    attributes:
+      label: 해결 방안 (선택)
