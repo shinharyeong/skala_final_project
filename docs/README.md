@@ -7,3 +7,4 @@
 ## 문서 목록
 
 - [도메인 규칙](domain-rules.md) — 제출·버전·변경 사유·Gap·master 규칙
+- [업무 흐름도](flow.md) — 연간 계획·월 실적·Gap 검토·master 단계별 흐름 (Mermaid)
