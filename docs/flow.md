@@ -15,7 +15,7 @@
 ```mermaid
 flowchart LR
     S1["1. 연간 계획 수립"] --> S2["2. 월 실적 제출"]
-    S2 --> S3["3. Gap 검토·소명"]
+    S2 --> S3["3. 소명 검토·승인"]
     S3 --> S4["4. master·대시보드·보고"]
     S4 -->|다음 달| S2
 ```
@@ -27,8 +27,8 @@ flowchart TD
     A(["시작"])
     B["연간 계획 제출 요청<br/>(대상 연도 지정)"]
     C["조직 담당자에게 알림"]
-    D["연간 계획 엑셀 업로드"]
-    E{"파일 형식·필수값<br/>자동 검증 통과?"}
+    D["연간 계획 엑셀 업로드<br/>예) D100_2026-PLAN.xlsx"]
+    E{"파일 이름 규칙·형식·필수값<br/>자동 검증 통과?"}
     E1["오류 위치 표시<br/>(제출되지 않음)"]
     F["제출본 생성<br/>상태: 검토 대기"]
     G{"계획이 올바른가?"}
@@ -70,24 +70,35 @@ flowchart TD
     C["조직 담당자에게 알림"]
     D{"업로드 가능?<br/>열린 요청 있음<br/>그리고 검토 대기 제출본 없음"}
     D1["업로드 버튼 비활성<br/>(사유 표시)"]
-    E["실적 + 다음 달 추정치<br/>엑셀 업로드"]
+    E["엑셀 업로드<br/>해당 월 실적 + 다음 달~12월 추정<br/>예) D100_2026-02.xlsx"]
+    FN{"파일 이름 규칙?<br/>조직코드 · 대상 월 일치"}
+    FN1["이름 오류 표시<br/>(파싱하지 않음)"]
     F{"파서 자동 검증 통과?"}
     F1["오류 위치 표시<br/>(제출되지 않음)"]
-    G["마지막 승인본과 비교<br/>(파일에 든 모든 월)"]
-    H{"이미 제출한 값이<br/>바뀌었나?"}
-    I["변경 항목 표시<br/>예) 2월 광고비 1,200 → 1,350"]
-    J["항목별 변경 사유 입력<br/>(필수)"]
-    K["제출 완료<br/>버전 YYYY-MM-NN 부여<br/>상태: 검토 대기"]
-    L["경영기획 담당자에게 알림<br/>(변경 사유 포함)"]
-    M(["Gap 검토 단계로"])
+    G["마지막 승인본과 비교"]
+    H{"승인된 값이 바뀌었나?<br/>같은 달 재제출 · 과거 달 실적"}
+    I["바뀐 칸 표시<br/>예) 2026-02-02 · 4월 · 광고비 · 추정<br/>1,200 → 1,350"]
+    J["칸별 변경 사유 입력<br/>(필수)"]
+    GP["Gap 계산<br/>실적 Gap: 실적 − 연간 계획<br/>추정 Gap: 추정 − 직전 추정"]
+    X{"종류별 기준 초과 칸?<br/>% 그리고 금액"}
+    Y["기준 초과 칸 표시"]
+    Z["칸별 소명 작성<br/>(필수, 버전·월·항목·종류 태그)"]
+    K["제출 완료<br/>저장 이름 D100_2026-02-NN.xlsx<br/>상태: 검토 대기"]
+    L["경영기획 담당자에게 알림<br/>(변경 사유·소명 포함)"]
+    M(["소명 검토 단계로"])
 
     A --> B --> C --> D
     D -->|아니오| D1
-    D -->|예| E --> F
+    D -->|예| E --> FN
+    FN -->|아니오| FN1 --> E
+    FN -->|예| F
     F -->|아니오| F1 --> E
     F -->|예| G --> H
-    H -->|예| I --> J --> K
-    H -->|아니오| K
+    H -->|예| I --> J --> GP
+    H -->|아니오| GP
+    GP --> X
+    X -->|예| Y --> Z --> K
+    X -->|아니오| K
     K --> L --> M
 
     classDef planner fill:#E3EDFD,stroke:#3B6FD8,color:#1A2B4C
@@ -95,46 +106,34 @@ flowchart TD
     classDef system fill:#EFEFEF,stroke:#8A8A8A,color:#222
     classDef terminal fill:#D7F4DD,stroke:#3E9E55,color:#173D20
     class B planner
-    class E,J org
-    class C,D,D1,F,F1,G,H,I,K,L system
+    class E,J,Z org
+    class C,D,D1,FN,FN1,F,F1,G,H,I,GP,X,Y,K,L system
     class A,M terminal
 ```
 
-## 3. Gap 검토·소명
+## 3. 소명 검토·승인
 
 ```mermaid
 flowchart TD
     A(["검토 대기 제출본"])
-    B["Gap 계산<br/>조직 × 항목 × 월 손익<br/>실적 − 계획"]
-    C["기준 슬라이더 조정<br/>(% · 금액, 실시간 미리보기)"]
-    D{"적용?"}
-    E["기준값 저장"]
-    F["기준 초과 Gap 목록<br/>% 그리고 금액 초과<br/>+ 계획 0, 실적 ≠ 0"]
-    G{"항목별<br/>산출 근거 명확?"}
-    H["확인(인정)"]
-    I["Gap 소명 요청"]
-    J["소명 요청 알림"]
-    K["소명 작성"]
-    L{"소명이 적절한가?"}
-    L1["소명 재요청"]
-    M["소명 확정<br/>소명 모음·조직별 현황에 저장"]
-    N{"모든 Gap 항목<br/>처리 완료?"}
-    V["변경 사유 확인<br/>(있는 경우)"]
+    B["변경 사유·소명 목록<br/>(버전·월·항목·종류 태그)"]
+    G{"소명이 적절한가?<br/>(칸별)"}
+    H["수용"]
+    I["소명 재요청<br/>(재요청 사유 첨부)"]
+    J["소명 재요청 알림"]
+    K["소명 다시 작성"]
+    N{"모든 소명<br/>수용 완료?"}
     O{"제출본 승인?"}
-    P["승인·아카이브<br/>조직별 현황에 버전 기록"]
+    P["승인·아카이브<br/>조직별 현황에 버전·소명 기록"]
     R["재제출 요청"]
-    R1["상태: 재제출 요청<br/>다음 회차 업로드 가능"]
+    R1["상태: 재제출 요청<br/>그 요청에 대한 재제출만 가능"]
     Q(["master 단계로"])
 
-    A --> B --> C --> D
-    D -->|아니오| C
-    D -->|예| E --> F --> G
+    A --> B --> G
     G -->|예| H --> N
-    G -->|아니오| I --> J --> K --> L
-    L -->|아니오| L1 --> K
-    L -->|예| M --> N
+    G -->|아니오| I --> J --> K --> G
     N -->|아니오| G
-    N -->|예| V --> O
+    N -->|예| O
     O -->|예| P --> Q
     O -->|아니오| R --> R1
 
@@ -142,10 +141,31 @@ flowchart TD
     classDef org fill:#FFF3D1,stroke:#C99400,color:#3D2E00
     classDef system fill:#EFEFEF,stroke:#8A8A8A,color:#222
     classDef terminal fill:#D7F4DD,stroke:#3E9E55,color:#173D20
-    class C,D,G,H,I,L,L1,V,O,R planner
+    class B,G,H,I,O,R planner
     class K org
-    class B,E,F,J,M,N,P,R1 system
+    class J,N,P,R1 system
     class A,Q terminal
+```
+
+### Gap 기준 설정 (경영기획 담당자, 수시)
+
+```mermaid
+flowchart LR
+    T1["Gap 종류 선택<br/>실적 Gap / 추정 Gap"]
+    T2["슬라이더 조정<br/>% · 금액, 실시간 미리보기"]
+    T3{"적용?"}
+    T4["기준값 저장<br/>이후 제출부터 적용"]
+
+    T1 --> T2 --> T3
+    T3 -->|아니오| T2
+    T3 -->|예| T4
+
+    classDef planner fill:#E3EDFD,stroke:#3B6FD8,color:#1A2B4C
+    classDef org fill:#FFF3D1,stroke:#C99400,color:#3D2E00
+    classDef system fill:#EFEFEF,stroke:#8A8A8A,color:#222
+    classDef terminal fill:#D7F4DD,stroke:#3E9E55,color:#173D20
+    class T1,T2,T3 planner
+    class T4 system
 ```
 
 ## 4. master·대시보드·보고
@@ -196,22 +216,19 @@ stateDiagram-v2
     approved --> [*]: 아카이브
 ```
 
-### Gap 항목
+### Gap 항목 (소명)
 
 ```mermaid
 stateDiagram-v2
-    state "미검토" as open
-    state "확인(인정)" as accepted
-    state "소명 요청" as requested
+    state "소명 필요" as required
     state "소명 작성됨" as answered
-    state "소명 확정" as resolved
+    state "재요청" as rerequested
+    state "수용" as accepted
 
-    [*] --> open: 기준 초과
-    open --> accepted: 산출 근거 명확
-    open --> requested: 산출 근거 불명확
-    requested --> answered: 조직 담당자 작성
-    answered --> resolved: 적절
-    answered --> requested: 재요청
+    [*] --> required: 제출 시 기준 초과
+    required --> answered: 조직이 소명 작성 후 제출
+    answered --> accepted: 경영기획 수용
+    answered --> rerequested: 경영기획 재요청
+    rerequested --> answered: 조직이 다시 작성
     accepted --> [*]
-    resolved --> [*]
 ```
